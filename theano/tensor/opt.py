@@ -1336,7 +1336,11 @@ class ShapeFeature(object):
                     assert d.dtype in theano.tensor.discrete_dtypes, (node, d.dtype)
                     assert str(d.dtype) != 'uint64', node
                     new_shape += sh[len(new_shape):i + 1]
-                    new_shape[i] = theano.tensor.cast(d, 'int64')
+                    if isinstance(d, T.Constant):
+                        casted_d = T.constant(d.data, dtype='int64')
+                    else:
+                        casted_d = theano.tensor.cast(d, 'int64')
+                    new_shape[i] = casted_d
             if new_shape:
                 # We replace the shape with wrong dtype by the one with
                 # 'int64'.
@@ -1889,6 +1893,33 @@ def local_track_shape_i(node):
         assert isinstance(node.op, Shape_i)
         replacement = shape_feature.scheduled[node]
         return [shape_feature.shape_of[replacement][node.op.i]]
+
+
+@register_specialize
+@register_canonicalize
+@gof.local_optimizer([Subtensor])
+def local_subtensor_inc_subtensor(node):
+    """
+    Subtensor(SetSubtensor(x, y, idx), idx) -> y
+
+    """
+    if isinstance(node.op, Subtensor):
+        x = node.inputs[0]
+        if not x.owner or not isinstance(x.owner.op, IncSubtensor):
+            return
+        if not x.owner.op.set_instead_of_inc:
+            return
+
+        if x.owner.inputs[2:] == node.inputs[1:] and tuple(x.owner.op.idx_list) == tuple(node.op.idx_list):
+            # if x[idx] and y have the same ndim (and shape), directly return y
+            if x.owner.inputs[0].ndim - (len(node.op.idx_list) - sum([isinstance(idx, slice) for idx in node.op.idx_list])) == x.owner.inputs[1].ndim:
+                return [x.owner.inputs[1]]
+            # else y is broadcastable, return alloc of broadcastable y
+            else:
+                x_subtensor = node.op(x.owner.inputs[0], *x.owner.inputs[2:])
+                return [T.alloc(x.owner.inputs[1], *x_subtensor.shape)]
+        else:
+            return
 
 
 @register_specialize
@@ -5902,7 +5933,10 @@ def local_mul_specialize(node):
             if new_inputs:
                 if len(new_inputs) == 1:
                     if neg:
-                        rval = -new_inputs[0]
+                        if new_inputs[0].dtype in (T.uint_dtypes + ['bool']):
+                            return
+                        else:
+                            rval = -new_inputs[0]
                     else:
                         rval = new_inputs[0]
                 else:
@@ -6117,6 +6151,49 @@ def local_log_add(node):
                 return [ret]
 
 
+@gof.local_optimizer([T.log])
+def local_log_sum_exp(node):
+    # log(sum_i(exp(x_i))) = x_max + log(sum_i(exp(x_i - x_max)))
+
+    if node.op != T.log:
+        return
+
+    sum_node = node.inputs[0].owner
+    # If the sum has keepdims=True, there might be a dimshuffle
+    if sum_node and isinstance(sum_node.op, T.DimShuffle):
+        dimshuffle_op = sum_node.op
+        sum_node = sum_node.inputs[0].owner
+    else:
+        dimshuffle_op = None
+
+    if not sum_node or not isinstance(sum_node.op, T.Sum):
+        return
+
+    exp_node, axis = sum_node.inputs[0].owner, sum_node.op.axis
+    if not exp_node or not (
+            isinstance(exp_node.op, Elemwise) and
+            isinstance(exp_node.op.scalar_op, scalar.Exp)):
+        return
+
+    pre_exp = exp_node.inputs[0]
+    max_pre_exp = T.max(pre_exp, axis=axis)
+    max_pre_exp_keepdims = T.makeKeepDims(pre_exp, max_pre_exp, axis)
+
+    ret = (max_pre_exp +
+           T.log(T.sum(T.exp(pre_exp - max_pre_exp_keepdims), axis=axis)))
+
+    # Restore the dimshuffle op, if any.
+    if dimshuffle_op:
+        ret = dimshuffle_op(ret)
+
+    return [ret]
+
+
+compile.optdb.register('local_log_sum_exp',
+                       in2out(local_log_sum_exp, ignore_newtrees=True),
+                       1.6, 'fast_run')
+
+
 def add_calculate(num, denum, aslist=False, out_type=None):
     # TODO: make sure that this function and mul_calculate are similar
     if out_type is None:
@@ -6299,20 +6376,12 @@ def constant_folding(node):
     for o in node.outputs:
         storage_map[o] = [None]
         compute_map[o] = [False]
+    impl = None
     if (hasattr(node.op, 'python_constant_folding') and
             node.op.python_constant_folding(node)):
-        old_value = getattr(node.op, '_op_use_c_code', False)
-        try:
-            node.op._op_use_c_code = False
-            thunk = node.op.make_thunk(node,
-                                       storage_map,
-                                       compute_map,
-                                       [])
-        finally:
-            node.op._op_use_c_code = old_value
-    else:
-        thunk = node.op.make_thunk(node, storage_map, compute_map,
-                                   no_recycling=[])
+        impl = 'py'
+    thunk = node.op.make_thunk(node, storage_map, compute_map,
+                               no_recycling=[], impl=impl)
 
     required = thunk()
     assert not required  # a node whose inputs are all provided should always

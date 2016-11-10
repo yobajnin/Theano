@@ -68,6 +68,7 @@ def reg_context(name, ctx):
     if not isinstance(ctx, gpuarray.GpuContext):
         raise TypeError("context is not GpuContext")
     _context_reg[name] = ctx
+    _props_map[ctx] = dict()
 
 
 def get_context(name):
@@ -95,6 +96,26 @@ def list_contexts():
 
     """
     return _context_reg.keys()
+
+# Mappings of properties to contexts.  Please never use this if you
+# can avoid it.
+
+# This is basically a way to store "global" variables that depend on
+# the context.
+_props_map = {}
+
+
+def _get_props(name):
+    ctx = get_context(name)
+    return _props_map[ctx]
+
+
+def get_prop(name, k):
+    return _get_props(name)[k]
+
+
+def set_prop(name, k, v):
+    _get_props(name)[k] = v
 
 
 # Private method
@@ -387,6 +408,7 @@ class GpuArrayType(Type):
                 'float16': (float, 'npy_float16', 'NPY_FLOAT16'),
                 'float32': (float, 'npy_float32', 'NPY_FLOAT32'),
                 'float64': (float, 'npy_float64', 'NPY_FLOAT64'),
+                'bool': (int, 'npy_bool', 'NPY_BOOL'),
                 'uint8': (int, 'npy_uint8', 'NPY_UINT8'),
                 'int8': (int, 'npy_int8', 'NPY_INT8'),
                 'uint16': (int, 'npy_uint16', 'NPY_UINT16'),

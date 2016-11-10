@@ -22,9 +22,14 @@ from theano.scan_module import scan_utils, scan_op, scan_opt
 
 from theano.tensor.nnet.conv import ConvOp
 from theano.tensor.nnet.blocksparse import SparseBlockGemv, SparseBlockOuter
-from theano.tensor.nnet.abstract_conv import (AbstractConv2d,
+from theano.tensor.nnet.abstract_conv import (BaseAbstractConv,
+                                              AbstractConv2d,
                                               AbstractConv2d_gradWeights,
-                                              AbstractConv2d_gradInputs)
+                                              AbstractConv2d_gradInputs,
+                                              AbstractConv3d,
+                                              AbstractConv3d_gradWeights,
+                                              AbstractConv3d_gradInputs)
+import theano.tensor.signal.pool as pool
 
 from theano.tests.breakpoint import PdbBreakpoint
 
@@ -40,7 +45,10 @@ from .basic_ops import (as_gpuarray_variable, infer_context_name,
 from .blas import (gpu_dot22, GpuGemm, GpuGer, GpuGemmBatch,
                    gpugemm_no_inplace, gpugemm_inplace,
                    gpugemmbatch_no_inplace,
-                   gpugemv_no_inplace, gpugemv_inplace)
+                   gpugemv_no_inplace, gpugemv_inplace,
+                   GpuCorrMM, GpuCorrMM_gradInputs, GpuCorrMM_gradWeights,
+                   GpuCorr3dMM, GpuCorr3dMM_gradInputs, GpuCorr3dMM_gradWeights,
+                   GpuDownsampleFactorMaxGradGrad)
 from .blocksparse import (GpuSparseBlockGemv, GpuSparseBlockOuter,
                           gpu_sparse_block_outer,
                           gpu_sparse_block_outer_inplace,
@@ -56,7 +64,7 @@ from .subtensor import (GpuIncSubtensor, GpuSubtensor,
                         GpuAdvancedSubtensor1,
                         GpuAdvancedIncSubtensor1,
                         GpuAdvancedIncSubtensor1_dev20)
-from .opt_util import alpha_merge, output_merge
+from .opt_util import alpha_merge, output_merge, pad_dims, unpad_dims
 
 _logger = logging.getLogger("theano.gpuarray.opt")
 
@@ -1128,27 +1136,6 @@ def local_gpua_gemmbatch(op, context_name, inputs, outputs):
     return gpugemmbatch_no_inplace(c, 1.0, a, b, 0.0)
 
 
-@register_opt('fast_compile')
-@op_lifter([tensor.basic.Dot])
-@register_opt2([tensor.basic.Dot], 'fast_compile')
-def local_gpua_hgemm(op, context_name, inputs, outputs):
-    from theano.sandbox.cuda import nvcc_compiler
-    if nvcc_compiler.nvcc_version < '7.5':
-        _logger.warning("Not performing dot of float16 on the GPU since "
-                        "cuda 7.5 is not available. Updating could speed up "
-                        "your code.")
-        return
-    A = inputs[0]
-    B = inputs[1]
-    if (A.ndim == 2 and B.ndim == 2 and
-            A.dtype == 'float16' and B.dtype == 'float16'):
-        fgraph = outputs[0].fgraph
-        C = gpu_alloc_empty(context_name, dtype='float16')(
-            shape_i(A, 0, fgraph),
-            shape_i(B, 1, fgraph))
-        return gpugemm_no_inplace(C, 1.0, A, B, 0.0)
-
-
 @register_opt()
 @alpha_merge(GpuGemm, alpha_in=1, beta_in=4)
 def local_gpua_gemm_alpha_merge(node, *inputs):
@@ -1293,28 +1280,341 @@ def local_inplace_sparseblockouter(node):
         return [GpuSparseBlockOuter(inplace=True)(*node.inputs)]
 
 
+# Move to Gpu optimization
+@local_optimizer([GpuFromHost,
+                  AbstractConv2d,
+                  AbstractConv2d_gradWeights,
+                  AbstractConv2d_gradInputs,
+                  AbstractConv3d,
+                  AbstractConv3d_gradWeights,
+                  AbstractConv3d_gradInputs])
+def local_conv_gpu_conv(node):
+    """
+    gpu_from_host(AbstractConv) -> AbstractConv(gpu_from_host)
+
+    AbstractConv(host_from_gpu) -> host_from_gpu(AbstractConv)
+    """
+    if isinstance(node.op, GpuFromHost):
+        host_input = node.inputs[0]
+        if host_input.owner and isinstance(host_input.owner.op,
+                                           BaseAbstractConv):
+
+            conv = host_input.owner.op
+            inps = list(host_input.owner.inputs)
+            ctx = infer_context_name(*inps)
+            inps[0] = as_gpuarray_variable(inps[0], context_name=ctx)
+            inps[1] = as_gpuarray_variable(inps[1], context_name=ctx)
+            out = conv(*inps)
+            # out is on the GPU because both inputs are.
+            out = theano.tensor.patternbroadcast(out,
+                                                 node.outputs[0].broadcastable)
+            return [out]
+
+    if isinstance(node.op, BaseAbstractConv):
+        # conv(host_from_gpu) -> host_from_gpu(gpu_conv)
+        inp1 = node.inputs[0]
+        inp2 = node.inputs[1]
+        if ((isinstance(inp1.type, GpuArrayType) and
+             isinstance(inp2.type, GpuArrayType))):
+            # Both inputs are already directly on the GPU, nothing to do
+            return
+
+        inp1_on_gpu = (isinstance(inp1.type, GpuArrayType) or
+                       (inp1.owner and isinstance(inp1.owner.op, HostFromGpu)))
+        inp2_on_gpu = (isinstance(inp2.type, GpuArrayType) or
+                       (inp2.owner and isinstance(inp2.owner.op, HostFromGpu)))
+
+        if inp1_on_gpu or inp2_on_gpu:
+            conv = node.op
+            inps = list(node.inputs)
+            ctx = infer_context_name(*inps)
+            inps[0] = as_gpuarray_variable(inps[0], context_name=ctx)
+            inps[1] = as_gpuarray_variable(inps[1], context_name=ctx)
+            out = conv(*inps)
+            # out is on the GPU because both inputs are.
+            out = theano.tensor.patternbroadcast(
+                out,
+                node.outputs[0].broadcastable)
+            # If the original output was on CPU, we have to transfer it
+            if isinstance(node.outputs[0].type, tensor.TensorType):
+                return [tensor.as_tensor_variable(out)]
+            else:
+                return [out]
+register_opt()(local_conv_gpu_conv)
+
+
+# CorrMM opt
+@local_optimizer([AbstractConv2d])
+def local_abstractconv_gemm(node):
+    if not isinstance(node.op, AbstractConv2d):
+        return None
+    img, kern = node.inputs
+    if (not isinstance(img.type, GpuArrayType) or
+            not isinstance(kern.type, GpuArrayType)):
+        return None
+    ctx = infer_context_name(img, kern)
+
+    border_mode = node.op.border_mode
+    subsample = node.op.subsample
+    filter_dilation = node.op.filter_dilation
+    if ((border_mode == 'full') and (subsample == (1, 1))):
+        if not node.op.filter_flip:
+            kern = kern[:, :, ::-1, ::-1]
+        # need to dimshuffle the kernel for full convolution
+        kern = kern.dimshuffle(1, 0, 2, 3)
+        # call GpuCorrMM_gradInputs
+        rval = GpuCorrMM_gradInputs('valid',
+                                    subsample,
+                                    filter_dilation)(
+            gpu_contiguous(kern), gpu_contiguous(img))
+    else:
+        # need to flip the kernel if necessary
+        if node.op.filter_flip:
+            kern = kern[:, :, ::-1, ::-1]
+        # By default use GpuCorrMM
+        rval = GpuCorrMM(border_mode,
+                         subsample,
+                         filter_dilation)(gpu_contiguous(img),
+                                          gpu_contiguous(kern))
+
+        # call GpuCorrMM_gradWeights if good
+        # (the latter is faster if batchsize * kernelHeight * kernelWidth
+        # is larger than inputChannels * outputHeight * outputWidth.
+        # GpuConv does not always store information on the batchsize and
+        # channels, though, so we only use what information we have.)
+        if ((subsample == (1, 1)) and (filter_dilation == (1, 1)) and
+                (node.op.imshp is not None) and
+                (None not in node.op.imshp[-2:]) and
+                (node.op.kshp is not None) and
+                (None not in node.op.kshp) and
+                border_mode != "half"):
+            # we know the kernel and output size
+            prod1 = node.op.kshp[0] * node.op.kshp[1]
+            prod2 = ((node.op.imshp[-2] - node.op.kshp[0] + 1) *
+                     (node.op.imshp[-1] - node.op.kshp[1] + 1))
+            if (None not in node.op.imshp[:1]):
+                # we also know batchsize and input channels
+                prod1 *= node.op.imshp[0]
+                prod2 *= node.op.imshp[1]
+            # compare to decide
+            if prod1 > prod2:
+                rval = GpuCorrMM_gradWeights(border_mode,
+                                             subsample,
+                                             filter_dilation)(
+                    gpu_contiguous(img.dimshuffle(1, 0, 2, 3)),
+                    gpu_contiguous(kern.dimshuffle(1, 0, 2, 3)))
+                # (we need to wrap the result in as_gpuarray_variable,
+                # because we are not allowed to replace a GpuArray with
+                # a DimShuffle instance in a graph optimization)
+                rval = as_gpuarray_variable(
+                    rval.dimshuffle(1, 0, 2, 3),
+                    context_name=ctx)
+    return [rval]
+
+
+@local_optimizer([AbstractConv3d])
+def local_abstractconv3d_gemm(node):
+    if not isinstance(node.op, AbstractConv3d):
+        return None
+    img, kern = node.inputs
+    if (not isinstance(img.type, GpuArrayType) or
+            not isinstance(kern.type, GpuArrayType)):
+        return None
+    ctx = infer_context_name(img, kern)
+
+    border_mode = node.op.border_mode
+    subsample = node.op.subsample
+    filter_dilation = node.op.filter_dilation
+    if ((border_mode == 'full') and (subsample == (1, 1, 1))):
+        if not node.op.filter_flip:
+            kern = kern[:, :, ::-1, ::-1, ::-1]
+        # need to dimshuffle the kernel for full convolution
+        kern = kern.dimshuffle(1, 0, 2, 3, 4)
+        # call GpuCorr3dMM_gradInputs
+        rval = GpuCorr3dMM_gradInputs('valid',
+                                      subsample,
+                                      filter_dilation)(
+            gpu_contiguous(kern), gpu_contiguous(img))
+    else:
+        # need to flip the kernel if necessary
+        if node.op.filter_flip:
+            kern = kern[:, :, ::-1, ::-1, ::-1]
+        # By default use GpuCorr3dMM
+        rval = GpuCorr3dMM(border_mode,
+                           subsample,
+                           filter_dilation)(gpu_contiguous(img),
+                                            gpu_contiguous(kern))
+
+        # call GpuCorr3dMM_gradWeights if good
+        # (the latter is faster if batchsize * kernelHeight * kernelWidth * kernelDepth
+        # is larger than inputChannels * outputHeight * outputWidth * outputDepth.
+        # GpuConv does not always store information on the batchsize and
+        # channels, though, so we only use what information we have.)
+        if ((subsample == (1, 1, 1)) and (filter_dilation == (1, 1, 1)) and
+                (node.op.imshp is not None) and
+                (None not in node.op.imshp[-3:]) and
+                (node.op.kshp is not None) and
+                (None not in node.op.kshp) and
+                border_mode != "half"):
+            # we know the kernel and output size
+            prod1 = node.op.kshp[0] * node.op.kshp[1] * node.op.kshp[2]
+            prod2 = ((node.op.imshp[-3] - node.op.kshp[0] + 1) *
+                     (node.op.imshp[-2] - node.op.kshp[1] + 1) *
+                     (node.op.imshp[-1] - node.op.kshp[2] + 1))
+            if (None not in node.op.imshp[:1]):
+                # we also know batchsize and input channels
+                prod1 *= node.op.imshp[0]
+                prod2 *= node.op.imshp[1]
+            # compare to decide
+            if prod1 > prod2:
+                rval = GpuCorr3dMM_gradWeights(border_mode,
+                                               subsample,
+                                               filter_dilation)(
+                    gpu_contiguous(img.dimshuffle(1, 0, 2, 3, 4)),
+                    gpu_contiguous(kern.dimshuffle(1, 0, 2, 3, 4)))
+                # (we need to wrap the result in as_gpuarray_variable,
+                # because we are not allowed to replace a GpuArray with
+                # a DimShuffle instance in a graph optimization)
+                rval = as_gpuarray_variable(
+                    rval.dimshuffle(1, 0, 2, 3, 4),
+                    context_name=ctx)
+    return [rval]
+
+
+@local_optimizer([AbstractConv2d_gradWeights])
+def local_abstractconv_gradweights_gemm(node):
+    if not isinstance(node.op, AbstractConv2d_gradWeights):
+        return None
+    img, topgrad, shape = node.inputs
+    if not isinstance(img.type, GpuArrayType) or \
+            not isinstance(topgrad.type, GpuArrayType):
+        return None
+    ctx = infer_context_name(img, topgrad)
+
+    rval = GpuCorrMM_gradWeights(border_mode=node.op.border_mode,
+                                 subsample=node.op.subsample,
+                                 filter_dilation=node.op.filter_dilation)(
+        gpu_contiguous(img), gpu_contiguous(topgrad), shape)
+    if node.op.filter_flip:
+        rval = rval[:, :, ::-1, ::-1]
+    rval = tensor.patternbroadcast(rval, node.outputs[0].broadcastable)
+    rval = as_gpuarray_variable(rval, context_name=ctx)
+    return [rval]
+
+
+@local_optimizer([AbstractConv3d_gradWeights])
+def local_abstractconv3d_gradweights_gemm(node):
+    if not isinstance(node.op, AbstractConv3d_gradWeights):
+        return None
+    img, topgrad, shape = node.inputs
+    if not isinstance(img.type, GpuArrayType) or \
+            not isinstance(topgrad.type, GpuArrayType):
+        return None
+    ctx = infer_context_name(img, topgrad)
+
+    rval = GpuCorr3dMM_gradWeights(border_mode=node.op.border_mode,
+                                   subsample=node.op.subsample,
+                                   filter_dilation=node.op.filter_dilation)(
+        gpu_contiguous(img), gpu_contiguous(topgrad), shape)
+    if node.op.filter_flip:
+        rval = rval[:, :, ::-1, ::-1, ::-1]
+    rval = tensor.patternbroadcast(rval, node.outputs[0].broadcastable)
+    rval = as_gpuarray_variable(rval, context_name=ctx)
+    return [rval]
+
+
+@local_optimizer([AbstractConv2d_gradInputs])
+def local_abstractconv_gradinputs_gemm(node):
+    if not isinstance(node.op, AbstractConv2d_gradInputs):
+        return None
+    kern, topgrad, shape = node.inputs
+    if not isinstance(kern.type, GpuArrayType) or \
+            not isinstance(topgrad.type, GpuArrayType):
+        return None
+
+    if node.op.filter_flip:
+        kern = kern[:, :, ::-1, ::-1]
+
+    rval = GpuCorrMM_gradInputs(border_mode=node.op.border_mode,
+                                subsample=node.op.subsample,
+                                filter_dilation=node.op.filter_dilation)(
+        gpu_contiguous(kern), gpu_contiguous(topgrad), shape)
+    return [rval]
+
+
+@local_optimizer([AbstractConv3d_gradInputs])
+def local_abstractconv3d_gradinputs_gemm(node):
+    if not isinstance(node.op, AbstractConv3d_gradInputs):
+        return None
+    kern, topgrad, shape = node.inputs
+    if not isinstance(kern.type, GpuArrayType) or \
+            not isinstance(topgrad.type, GpuArrayType):
+        return None
+
+    if node.op.filter_flip:
+        kern = kern[:, :, ::-1, ::-1, ::-1]
+
+    rval = GpuCorr3dMM_gradInputs(border_mode=node.op.border_mode,
+                                  subsample=node.op.subsample,
+                                  filter_dilation=node.op.filter_dilation)(
+        gpu_contiguous(kern), gpu_contiguous(topgrad), shape)
+    return [rval]
+
+
 # This deals with any abstract convs that have a transfer somewhere
 @register_opt('fast_compile', 'conv_dnn', 'cudnn')
 @op_lifter([AbstractConv2d,
             AbstractConv2d_gradWeights,
-            AbstractConv2d_gradInputs])
-def local_gpua_abstractconv2d(op, context_name, inputs, outputs):
+            AbstractConv2d_gradInputs,
+            AbstractConv3d,
+            AbstractConv3d_gradWeights,
+            AbstractConv3d_gradInputs])
+def local_gpua_abstractconv(op, context_name, inputs, outputs):
     if isinstance(outputs[0].type, GpuArrayType):
         # Don't handle this node here, it's already on the GPU.
         return
-    return local_gpua_lift_abstractconv2d_graph(op, context_name, inputs, outputs)
+    return local_gpua_lift_abstractconv_graph(op, context_name, inputs, outputs)
 
 
 @register_opt2([AbstractConv2d,
                 AbstractConv2d_gradWeights,
-                AbstractConv2d_gradInputs], 'fast_compile', 'conv_dnn', 'cudnn')
-def local_gpua_lift_abstractconv2d_graph(op, context_name, inputs, outputs):
+                AbstractConv2d_gradInputs,
+                AbstractConv3d,
+                AbstractConv3d_gradWeights,
+                AbstractConv3d_gradInputs], 'fast_compile', 'conv_dnn', 'cudnn')
+def local_gpua_lift_abstractconv_graph(op, context_name, inputs, outputs):
     inps = list(inputs)
     inps[0] = as_gpuarray_variable(inputs[0],
                                    context_name=context_name)
     inps[1] = as_gpuarray_variable(inputs[1],
                                    context_name=context_name)
     return [op(*inps)]
+
+
+@register_opt()
+@op_lifter([pool.DownsampleFactorMaxGradGrad])
+@register_opt2([pool.DownsampleFactorMaxGradGrad])
+def local_gpu_downsample_factor_max_grad_grad(op, ctx_name, inputs, outputs):
+    assert op.__props__ == ('ignore_border', 'mode', 'ndim')
+    inp, out, out_grad, ws, stride, pad = inputs
+    nd = op.ndim
+    if nd not in (2, 3):
+        return
+    inp = gpu_contiguous(as_gpuarray_variable(inp, ctx_name))
+    out = gpu_contiguous(as_gpuarray_variable(out, ctx_name))
+    out_grad = gpu_contiguous(as_gpuarray_variable(out_grad, ctx_name))
+
+    op = GpuDownsampleFactorMaxGradGrad(op.ignore_border, op.mode, op.ndim)
+    if inp.ndim == nd + 2:
+        return op(inp, out, out_grad, ws, stride, pad)
+    else:
+        # reshape to 4D or 5D with 2 non-pooling dimensions
+        inp_padded = pad_dims(inp, 2, nd)
+        out_padded = pad_dims(out, 2, nd)
+        out_grad_padded = pad_dims(out_grad, 2, nd)
+        ret_padded = op(inp_padded, out_padded, out_grad_padded,
+                        ws, stride, pad)
+        return unpad_dims(ret_padded, inp, 2, nd)
 
 
 @register_opt("low_memory")
@@ -1484,3 +1784,53 @@ optdb.register('gpua_scanOp_make_inplace',
                'gpuarray',
                'inplace',
                'scan')
+
+
+# Register GPU convolution implementation
+# They are tried in a specific order so we can control
+# which ones take precedence over others.
+abstractconv_groupopt = theano.gof.optdb.LocalGroupDB()
+abstractconv_groupopt.__name__ = "gpuarray_abstractconv_opts"
+register_opt('fast_compile')(abstractconv_groupopt)
+
+# cuDNN is first, but only registered if cuDNN is available.
+# (we import these opts here instead of at the top of this file
+# to avoid a circular dependency problem with dnn)
+from .dnn import (local_abstractconv_cudnn, local_abstractconv_gw_cudnn,
+                  local_abstractconv_gi_cudnn)     # noqa: 402
+abstractconv_groupopt.register('local_abstractconv_dnn',
+                               local_abstractconv_cudnn, 20,
+                               'conv_dnn',
+                               'gpuarray', 'fast_compile', 'fast_run', 'cudnn')
+abstractconv_groupopt.register('local_abstractconv_gw_dnn',
+                               local_abstractconv_gw_cudnn, 20,
+                               'conv_dnn',
+                               'gpuarray', 'fast_compile', 'fast_run', 'cudnn')
+abstractconv_groupopt.register('local_abstractconv_gi_dnn',
+                               local_abstractconv_gi_cudnn, 20,
+                               'conv_dnn',
+                               'gpuarray', 'fast_compile', 'fast_run', 'cudnn')
+# The GEMM-based convolution comes last to catch all remaining cases.
+# It can be disabled by excluding 'conv_gemm'.
+abstractconv_groupopt.register('local_abstractconv_gemm', local_abstractconv_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
+abstractconv_groupopt.register('local_abstractconv3d_gemm', local_abstractconv3d_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
+abstractconv_groupopt.register('local_abstractconv_gradweights_gemm',
+                               local_abstractconv_gradweights_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
+abstractconv_groupopt.register('local_abstractconv3d_gradweights_gemm',
+                               local_abstractconv3d_gradweights_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
+abstractconv_groupopt.register('local_abstractconv_gradinputs',
+                               local_abstractconv_gradinputs_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
+abstractconv_groupopt.register('local_abstractconv3d_gradinputs',
+                               local_abstractconv3d_gradinputs_gemm, 30,
+                               'conv_gemm',
+                               'gpuarray', 'fast_compile', 'fast_run')
